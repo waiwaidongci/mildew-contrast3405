@@ -1,4 +1,4 @@
-"""对巡检记录分组，计算条件增长倍数并保留命中证据。"""
+"""对已配对巡检分组，计算条件增长倍数并保留命中证据与成对核对表。"""
 
 from collections import Counter, defaultdict
 from datetime import date
@@ -23,6 +23,17 @@ _PATTERN_COLUMNS = (
 )
 _EVIDENCE_COLUMNS = (("pattern_ids", "命中模式编号"),) + tuple(
     (field["key"], field["label"]) for field in _FIELDS
+)
+_PAIR_COLUMNS = (
+    ("pair_no", "配对序号"), ("room", "库房"), ("shelf", "架位"),
+    ("positive_id", "有霉斑巡检单号"), ("positive_date", "有霉斑巡检日期"),
+    ("negative_id", "未见霉斑巡检单号"), ("negative_date", "未见霉斑巡检日期"),
+    ("gap_days", "间隔天数"),
+)
+_SHELF_COLUMNS = (
+    ("room", "库房"), ("shelf", "架位"),
+    ("positive_total", "见霉斑单数"), ("negative_total", "未见霉斑单数"),
+    ("pair_count", "已成对数量"), ("unpaired_count", "未配对余数"),
 )
 
 
@@ -101,15 +112,47 @@ def _table(title, columns, rows):
     return {"title": title, "columns": [{"key": key, "label": label} for key, label in columns], "rows": rows}
 
 
-def analyze(rows, normalized_params):
-    """对同一批有效巡检计算可重跑的单项及成对条件排名。"""
+def _pair_tables(pairing):
+    """构造可供页面逐对核对单号的配对表与架位进度表。"""
+    pair_rows = [
+        {
+            "pair_no": index,
+            "room": pair["room"],
+            "shelf": pair["shelf"],
+            "positive_id": pair["positive_id"],
+            "positive_date": pair["positive_date"],
+            "negative_id": pair["negative_id"],
+            "negative_date": pair["negative_date"],
+            "gap_days": pair["gap_days"],
+        }
+        for index, pair in enumerate(pairing["pairs"], start=1)
+    ]
+    shelf_rows = pairing.get("shelves", [])
+    return [
+        _table("霉斑巡检成对核对", _PAIR_COLUMNS, pair_rows),
+        _table("架位配对进度", _SHELF_COLUMNS, shelf_rows),
+    ]
+
+
+def analyze(rows, normalized_params, pairing=None):
+    """对已完成配对的巡检计算可重跑的单项及成对条件排名。
+
+    ``rows`` 为全部有效巡检；``pairing`` 为配对服务产出的配对视图。筛查只在
+    成对巡检（``paired_ids``）内比较有霉斑与未见霉斑两组，未配对单据不参与。
+    """
     records = validate_rows(rows)
     params = {
         field["key"]: _bounded(normalized_params.get(field["key"], field["default"]), field)
         for field in SPEC["params"]
     }
-    total = len(records)
-    positives = sum(row["mildew_observed"] for row in records)
+    if pairing is None:
+        raise ValueError("配对尚未完成，不能开始条件筛查")
+    paired_ids = {key for pair in pairing["pairs"]
+                  for key in (pair["positive_id"], pair["negative_id"])}
+    paired_records = [row for row in records if row["inspection_id"] in paired_ids]
+
+    total = len(paired_records)
+    positives = sum(row["mildew_observed"] for row in paired_records)
     negatives = total - positives
     threshold = params["humidity_threshold"]
     patterns = []
@@ -117,7 +160,7 @@ def analyze(rows, normalized_params):
     if positives and negatives:
         hits = defaultdict(Counter)
         patterns_by_id = {}
-        for row in records:
+        for row in paired_records:
             matching = _row_patterns(row, threshold)
             patterns_by_id[row["inspection_id"]] = matching
             for pattern in matching:
@@ -140,7 +183,7 @@ def analyze(rows, normalized_params):
                 "negative_smoothed": float(negative_smoothed),
                 "growth": float(growth),
             })
-        for row in sorted(records, key=lambda row: (row["inspection_date"], row["inspection_id"])):
+        for row in sorted(paired_records, key=lambda row: (row["inspection_date"], row["inspection_id"])):
             matching = sorted(pattern_ids[pattern] for pattern in patterns_by_id[row["inspection_id"]]
                               if pattern in pattern_ids)
             if matching:
@@ -148,37 +191,50 @@ def analyze(rows, normalized_params):
 
     if not positives or not negatives:
         missing_group = "见霉斑" if not positives else "未见霉斑"
-        headline = f"缺少{missing_group}的巡检记录，暂无法比较两组。"
+        headline = f"成对巡检中缺少{missing_group}的记录，暂无法比较两组。"
     elif patterns:
-        headline = f"筛出 {len(patterns)} 个伴随模式，{patterns[0]['conditions']}的增长倍数最高。"
+        headline = f"基于 {total} 张成对巡检筛出 {len(patterns)} 个伴随模式，{patterns[0]['conditions']}的增长倍数最高。"
     else:
-        headline = "本批巡检中没有模式同时达到命中数与增长倍数门槛。"
+        headline = "成对巡检中没有模式同时达到命中数与增长倍数门槛。"
 
+    pair_tables = _pair_tables(pairing)
     return {
-        "state": "warning" if not positives or not negatives or patterns else "ok",
+        "state": "warning" if not positives or not negatives or not patterns else "ok",
         "headline": headline,
         "note": (
-            f"纳入 {total} 条巡检。湿度达到 {threshold:g}% 归入高湿，平滑量 {params['smoothing']:g}。"
+            f"全部架位配对完成后才开始筛查：共 {pairing['pair_count']} 对、{total} 张成对巡检，"
+            f"未配对单据不参与两组比较。湿度达到 {threshold:g}% 归入高湿，平滑量 {params['smoothing']:g}。"
             f"门槛为正组命中至少 {params['min_positive_count']} 条、两组合计至少 {params['min_total_count']} 条、"
-            f"增长至少 {params['min_growth']:g} 倍。结果反映本批记录的关联，无法据此判定成因。"
+            f"增长至少 {params['min_growth']:g} 倍。配对不看湿度，结果反映成对记录的关联，无法据此判定成因。"
         ),
         "metrics": [
-            {"label": "见霉斑巡检", "value": positives, "detail": "正组支持度的分母"},
-            {"label": "未见霉斑巡检", "value": negatives, "detail": "负组支持度的分母"},
+            {"label": "配对数量", "value": pairing["pair_count"], "detail": "同库房同架位、间隔四天内的一正一负"},
+            {"label": "成对见霉斑巡检", "value": positives, "detail": "正组支持度的分母"},
+            {"label": "成对未见霉斑巡检", "value": negatives, "detail": "负组支持度的分母"},
             {"label": "入选模式", "value": len(patterns),
              "detail": f"单项 {sum(item['size'] == 1 for item in patterns)} 个，其余为成对条件"},
             {"label": "命中巡检", "value": len(evidence), "detail": "至少符合一个入选模式，按巡检单号计数"},
         ],
         "tables": [
+            pair_tables[0],
+            pair_tables[1],
             _table("伴随模式排名", _PATTERN_COLUMNS, patterns),
             _table("巡检证据明细", _EVIDENCE_COLUMNS, evidence),
         ],
         "charts": [{"title": "增长倍数最高的模式", "kind": "bar", "series": [
             {"label": item["pattern_id"], "value": item["growth"]} for item in patterns[:8]
         ]}] if patterns else [],
-        "sections": [{"title": "按模式复核巡检", "text": (
-            "用模式编号在巡检证据或下载的 CSV 中查找命中记录，再按巡检单号回查台账。"
-            "同一条巡检可命中多个模式。按见霉斑列分组，可核对排名表的两组命中数。"
-            "复核时查看同库房同期记录、连续湿度读数和设施报修单，再登记检查安排。"
+        "sections": [{"title": "按成对巡检复核", "text": (
+            "先在「霉斑巡检成对核对」表按配对序号核对每对的有霉斑与未见霉斑单号、库房架位和日期间隔，"
+            "确认一张单只出现一次；再用模式编号在巡检证据或下载的 CSV 中查找命中记录。"
+            "同一条巡检可命中多个模式。复核时结合同架位同期记录、连续湿度读数和设施报修单。"
         )}],
+        "pairing": {
+            "pair_count": pairing["pair_count"],
+            "paired_record_count": pairing.get("paired_record_count", 2 * pairing["pair_count"]),
+            "total_gap_days": pairing.get("total_gap_days",
+                                          sum(pair["gap_days"] for pair in pairing["pairs"])),
+            "completed_shelf_count": pairing.get("completed_shelf_count",
+                                                 len(pairing.get("shelves", []))),
+        },
     }

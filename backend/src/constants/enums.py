@@ -11,6 +11,11 @@ class Status(StrEnum):
     COMPLETE = 'complete'
     FAILED = 'failed'
 
+
+class PairingState(StrEnum):
+    RUNNING = 'running'
+    COMPLETE = 'complete'
+
 class Review(StrEnum):
     PENDING = 'pending'
     ACCEPTED = 'accepted'

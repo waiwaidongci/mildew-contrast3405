@@ -7,6 +7,7 @@ from src.config.database import Base, engine
 from src.config.settings import SEED_DEMO
 from src.domain.spec import SPEC
 from src.middlewares import errors, headers, rate
+from src.models import pairing as _pairing_model  # noqa: F401  # 注册配对进度表
 from src.routes import distribution, identity, registry, runs
 from src.utils.wakeup import broker
 

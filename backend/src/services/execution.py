@@ -2,11 +2,12 @@ import logging
 from datetime import date, timedelta
 from sqlalchemy import and_, or_, select
 from src.config.database import Session
-from src.constants.enums import Status
+from src.constants.enums import PairingState, Status
 from src.domain.analysis import analyze
 from src.domain.spec import SPEC
 from src.models.jobs import Delivery, Run, Schedule
 from src.models.source import Dataset
+from src.services import pairing as pairing_service
 from src.services.audit import record
 from src.utils.exports import write_report
 from src.utils.time import now
@@ -65,7 +66,22 @@ def execute(lease):
     job_id, attempt, rows, params = lease
     result = export = failure = None
     try:
-        result = analyze(rows, params)
+        # 第一阶段：逐架位配对并落库，可从已完成架位续跑；全部配齐后才筛查。
+        with Session.begin() as db:
+            run = db.get(Run, job_id, with_for_update=True)
+            if run.attempt != attempt or run.status != Status.RUNNING:
+                log.info('Run %s attempt %s superseded before pairing', job_id, attempt)
+                return
+            progress = pairing_service.run_pairing(db, job_id, attempt, rows)
+            if progress.attempt != attempt:
+                log.info('Run %s pairing attempt %s lost the lease', job_id, attempt)
+                return
+            pairing_view = pairing_service.pairing_summary(progress, rows)
+            record(db, 'worker', 'pairing.complete', job_id,
+                   attempt=attempt, pairs=progress.pair_count,
+                   shelves=len(progress.completed_shelves))
+        # 第二阶段：仅基于成对巡检做两组条件筛查（纯计算，不写配对表）。
+        result = analyze(rows, params, pairing_view)
         export = write_report(job_id, attempt, result)
     except ValueError as error:
         failure = str(error)[:500]
@@ -74,7 +90,9 @@ def execute(lease):
         failure = '计算失败，请检查字段口径后重试'
     with Session.begin() as db:
         job = db.get(Run, job_id, with_for_update=True)
+        # 迟归的旧任务不能改掉已存配对或覆盖新租约的运行结果。
         if job.attempt != attempt or job.status != Status.RUNNING:
+            log.info('Discarding stale result for run %s attempt %s', job_id, attempt)
             return
         job.lease_until = None
         job.finished_at = now()

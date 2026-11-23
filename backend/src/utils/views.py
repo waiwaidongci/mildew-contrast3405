@@ -11,10 +11,23 @@ def run(item, detail=False):
                  'author': item.author, 'review': item.review, 'decision': item.decision,
                  'created_at': iso(item.created_at), 'finished_at': iso(item.finished_at),
                  'scheduled_at': iso(item.scheduled_at), 'schedule_id': item.schedule_id,
-                 'has_export': bool(item.export_file), 'error': item.error}
+                 'has_export': bool(item.export_file), 'error': item.error, 'attempt': item.attempt}
     if detail:
         item_view.update(params=item.params, result=item.result, review_note=item.review_note)
     return item_view
+
+
+def pairing(progress):
+    return {
+        'run_id': progress.run_id,
+        'state': progress.state,
+        'pair_count': progress.pair_count,
+        'total_gap_days': progress.total_gap_days,
+        'completed_shelves': progress.completed_shelves,
+        'completed_shelf_count': len(progress.completed_shelves),
+        'attempt': progress.attempt,
+        'updated_at': iso(progress.updated_at),
+    }
 
 
 def schedule(item):

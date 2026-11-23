@@ -9,6 +9,7 @@ from src.controllers.auth import allow, current
 from src.domain.spec import SPEC
 from src.models.identity import User
 from src.models.jobs import Run
+from src.models.pairing import PairingProgress
 from src.models.source import Dataset
 from src.schemas.requests import ReviewRequest, RunRequest
 from src.services.audit import record
@@ -48,6 +49,35 @@ def create(body: RunRequest, db: Session = Depends(connection),
 @router.get('/{run_id}')
 def detail(run_id: int, db: Session = Depends(connection), actor: User = Depends(current)):
     return views.run(require_job(db, run_id), detail=True)
+
+
+@router.post('/{run_id}/retry', status_code=202)
+def retry(run_id: int, db: Session = Depends(connection),
+          actor: User = Depends(allow(Role.ADMIN, Role.ANALYST))):
+    """失败或中断的运行重新入队；已配对完的架位在 worker 续跑时直接跳过。"""
+    item = require_job(db, run_id, lock=True)
+    if item.status == Status.QUEUED:
+        raise HTTPException(409, '该运行已在排队等待')
+    if item.status == Status.RUNNING:
+        raise HTTPException(409, '该运行仍在后台执行，中断后会由租约自动续跑')
+    item.status = Status.QUEUED
+    item.error = None
+    item.finished_at = None
+    item.lease_until = None
+    record(db, actor.username, 'analysis.requeued', item.id, attempt=item.attempt)
+    db.commit()
+    wake()
+    return views.run(item, detail=True)
+
+
+@router.get('/{run_id}/pairing')
+def pairing(run_id: int, db: Session = Depends(connection), actor: User = Depends(current)):
+    require_job(db, run_id)
+    progress = db.scalar(select(PairingProgress).where(PairingProgress.run_id == run_id))
+    if progress is None:
+        return {'run_id': run_id, 'state': 'pending', 'pair_count': 0,
+                'completed_shelves': [], 'completed_shelf_count': 0, 'pairs': []}
+    return {**views.pairing(progress), 'pairs': progress.pairs}
 
 
 @router.get('/{run_id}/export')
